@@ -1,1143 +1,1625 @@
-# LICENSE: APACHE LICENSE
-# OWNER: PYROALWW
+# MADE BY @C4GWN
 # WWW.PYROLLC.COM.TR
 
-from flask import Flask, request, jsonify, send_from_directory, g
-from flask_socketio import SocketIO, emit, join_room, leave_room
-from flask_babel import Babel, gettext
-from elasticsearch import Elasticsearch
+from flask import Flask, request, jsonify
 import json
-import jwt
-from functools import wraps
-from datetime import datetime, timedelta
-from werkzeug.utils import secure_filename
 import os
 import uuid
-import re
-import requests
-from pydub import AudioSegment
-import threading
-import schedule
-import time
-import boto3
-from botocore.exceptions import ClientError
-import openai
-from profanity_check import predict
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
-import random
-import string
+from datetime import datetime, timedelta
+
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'cok_gizli_anahtar'
-app.config['UPLOAD_FOLDER'] = 'uploads'
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16 MB max upload size
-app.config['LANGUAGES'] = ['en', 'tr', 'es', 'fr', 'de']
-socketio = SocketIO(app, cors_allowed_origins="*")
-babel = Babel(app)
-es = Elasticsearch([{'host': 'localhost', 'port': 9200}])
+app.config['JSON_AS_ASCII'] = False
+DB_PATH = 'database.json'
 
-s3 = boto3.client('s3')
-S3_BUCKET = 'your-s3-bucket-name'
+##########################
+# Yardımcı Fonksiyonlar #
+##########################
 
-openai.api_key = 'your-openai-api-key'
-
-DB_FILE = 'database.json'
-ALLOWED_EXTENSIONS = {'txt', 'pdf', 'png', 'jpg', 'jpeg', 'gif', 'mp3', 'wav'}
-
-if not os.path.exists(app.config['UPLOAD_FOLDER']):
-    os.makedirs(app.config['UPLOAD_FOLDER'])
 def load_db():
-    try:
-        with open(DB_FILE, 'r') as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return {
-            "users": [],
-            "channels": [],
-            "messages": [],
-            "friendships": [],
-            "categories": [],
-            "guilds": [],
-            "roles": [],
-            "permissions": [],
-            "user_roles": [],
-            "blocked_users": [],
-            "reactions": [],
-            "activity_logs": []
-        }
+    if not os.path.exists(DB_PATH):
+        with open(DB_PATH, 'w', encoding='utf-8') as f:
+            json.dump({
+                "users": [],
+                "guilds": [],
+                "messages": [],
+                "direct_messages": [],
+                "friend_requests": []
+            }, f, ensure_ascii=False, indent=4)
+    with open(DB_PATH, 'r', encoding='utf-8') as f:
+        return json.load(f)
 
 def save_db(db):
-    with open(DB_FILE, 'w') as f:
-        json.dump(db, f, indent=2)
+    with open(DB_PATH, 'w', encoding='utf-8') as f:
+        json.dump(db, f, ensure_ascii=False, indent=4)
 
-def token_required(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        token = request.headers.get('Authorization')
-        if not token:
-            return jsonify({'message': 'Token is missing!'}), 401
-        try:
-            data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=["HS256"])
-            current_user = next((u for u in load_db()['users'] if u['username'] == data['username']), None)
-        except:
-            return jsonify({'message': 'Token is invalid!'}), 401
-        return f(current_user, *args, **kwargs)
-    return decorated
-@babel.localeselector
-def get_locale():
-    return request.accept_languages.best_match(app.config['LANGUAGES'])
+def find_user(db, username):
+    for user in db['users']:
+        if user['username'] == username:
+            return user
+    return None
 
-def translate(text):
-    return gettext(text)
-def allowed_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+def find_guild(db, guild_id):
+    for g in db['guilds']:
+        if g['id'] == guild_id:
+            return g
+    return None
 
-def has_permission(user_id, permission_name, guild_id=None, channel_id=None):
-    db = load_db()
-    user_roles = [ur['role_id'] for ur in db['user_roles'] if ur['user_id'] == user_id]
-    permissions = [p for p in db['permissions'] if p['role_id'] in user_roles and p['name'] == permission_name]
-    
-    if guild_id:
-        permissions = [p for p in permissions if p['guild_id'] == guild_id]
-    if channel_id:
-        permissions = [p for p in permissions if p['channel_id'] == channel_id]
-    
-    return len(permissions) > 0
+def find_channel_in_guild(guild, channel_id):
+    for ch in guild['channels']:
+        if ch['id'] == channel_id:
+            return ch
+    return None
 
-def log_activity(user_id, action, details=None):
-    db = load_db()
-    log = {
-        'id': str(uuid.uuid4()),
-        'user_id': user_id,
-        'action': action,
-        'details': details,
-        'timestamp': datetime.utcnow().isoformat()
+def find_category_in_guild(guild, category_id):
+    for cat in guild['categories']:
+        if cat['id'] == category_id:
+            return cat
+    return None
+
+def find_dm(db, dm_id):
+    for dm in db['direct_messages']:
+        if dm['id'] == dm_id:
+            return dm
+    return None
+
+def find_user_by_token(db, token):
+    # Basit token = username
+    return find_user(db, token)
+
+def user_in_guild(guild, username):
+    for m in guild['members']:
+        if m['username'] == username:
+            return m
+    return None
+
+def user_has_permission(guild, username, permission):
+    """
+    Kullanıcının sunucudaki rollerini inceler, 
+    eğer rollerden birinde 'permission' True ise yetkili kabul eder.
+    """
+    member = user_in_guild(guild, username)
+    if not member:
+        return False
+    user_roles = member['roles']
+    for r in guild['roles']:
+        if r['name'] in user_roles:
+            if r['permissions'].get(permission, False):
+                return True
+    return False
+
+def add_audit_log(guild, action, user, details=""):
+    guild['audit_logs'].append({
+        "id": str(uuid.uuid4()),
+        "action": action,
+        "user": user,
+        "timestamp": datetime.utcnow().isoformat(),
+        "details": details
+    })
+
+def create_default_role():
+    return {
+        "id": str(uuid.uuid4()),
+        "name": "member",
+        "permissions": {
+            "send_messages": True,
+            "read_messages": True
+        }
     }
-    db['activity_logs'].append(log)
-    save_db(db)
 
+def create_admin_role():
+    return {
+        "id": str(uuid.uuid4()),
+        "name": "admin",
+        "permissions": {
+            "manage_guild": True,
+            "manage_roles": True,
+            "manage_channels": True,
+            "kick_members": True,
+            "ban_members": True,
+            "send_messages": True,
+            "read_messages": True
+        }
+    }
+
+def message_belongs_to_channel(db, message_id):
+    for m in db['messages']:
+        if m['id'] == message_id:
+            return m
+    return None
+
+def is_channel_private(channel):
+    return channel.get('is_private', False)
+
+def user_has_access_to_channel(guild, user, channel):
+    """
+    Kanal private ise allowed_roles listesine bak.
+    """
+    if not is_channel_private(channel):
+        return True
+    member = user_in_guild(guild, user['username'])
+    if not member:
+        return False
+    user_roles = member['roles']
+    allowed = channel.get('allowed_roles', [])
+    return any(r in allowed for r in user_roles)
+
+def find_emoji(guild, emoji_id):
+    for e in guild['emojis']:
+        if e['id'] == emoji_id:
+            return e
+    return None
+
+def invite_valid(invite):
+    if invite['expires_at']:
+        if datetime.fromisoformat(invite['expires_at']) < datetime.utcnow():
+            return False
+    if invite['max_uses'] is not None and invite['uses'] >= invite['max_uses']:
+        return False
+    return True
+
+##########################
+# Kullanıcı İşlemleri    #
+##########################
+
+# /register [POST]
+# Body: {"username":"...","password":"...","avatar_url":"optional"}
 @app.route('/register', methods=['POST'])
 def register():
     db = load_db()
-    user = request.json
-    if any(u['username'] == user['username'] for u in db['users']):
-        return jsonify({"error": "Username is already taken"}), 400
-    user['id'] = str(uuid.uuid4())
-    user['role'] = 'user'
-    user['online'] = False
-    db['users'].append(user)
-    save_db(db)
-    log_activity(user['id'], 'user_registered')
-    return jsonify(user), 201
+    data = request.get_json()
+    username = data.get('username')
+    password = data.get('password')
+    avatar_url = data.get('avatar_url', None)
 
+    if find_user(db, username):
+        return jsonify({"status": "error", "message": "Username already exists"}), 400
+
+    new_user = {
+        "username": username,
+        "password": password,
+        "online": False,
+        "friends": [],
+        "guilds": [],
+        "dm_channels": [],
+        "avatar_url": avatar_url
+    }
+    db['users'].append(new_user)
+    save_db(db)
+    return jsonify({"status": "success", "message": "User registered"})
+
+
+# /login [POST]
+# Body: {"username":"...","password":"..."}
 @app.route('/login', methods=['POST'])
 def login():
     db = load_db()
-    auth = request.json
-    user = next((u for u in db['users'] if u['username'] == auth['username'] and u['password'] == auth['password']), None)
-    if user:
-        token = jwt.encode({'username': user['username'], 'exp': datetime.utcnow() + timedelta(hours=24)}, app.config['SECRET_KEY'])
-        user['online'] = True
-        save_db(db)
-        socketio.emit('user_online', {'user_id': user['id']}, broadcast=True)
-        log_activity(user['id'], 'user_logged_in')
-        return jsonify({'token': token, 'user_id': user['id']})
-    return jsonify({"error": "Invalid username or password"}), 401
+    data = request.get_json()
+    username = data.get('username')
+    password = data.get('password')
+    user = find_user(db, username)
+    if not user or user['password'] != password:
+        return jsonify({"status": "error", "message": "Invalid credentials"}), 401
+    user['online'] = True
+    save_db(db)
+    return jsonify({"status": "success", "token": username})
 
+
+# /logout [POST]
 @app.route('/logout', methods=['POST'])
-@token_required
-def logout(current_user):
+def logout():
     db = load_db()
-    user = next(u for u in db['users'] if u['id'] == current_user['id'])
+    auth = request.headers.get('Authorization')
+    if not auth or not auth.startswith("Bearer "):
+        return jsonify({"status": "error", "message": "Unauthorized"}), 401
+    token = auth.split(" ")[1]
+    user = find_user_by_token(db, token)
+    if not user:
+        return jsonify({"status": "error", "message": "Invalid token"}), 401
     user['online'] = False
     save_db(db)
-    socketio.emit('user_offline', {'user_id': user['id']}, broadcast=True)
-    log_activity(user['id'], 'user_logged_out')
-    return jsonify({"message": "Logged out successfully"})
+    return jsonify({"status": "success", "message": "Logged out"})
 
-@app.route('/guilds', methods=['GET', 'POST'])
-@token_required
-def guilds(current_user):
+
+# /user/<username> [GET]
+@app.route('/user/<username>', methods=['GET'])
+def get_user_info(username):
     db = load_db()
-    if request.method == 'GET':
-        return jsonify(db['guilds'])
-    elif request.method == 'POST':
-        if not has_permission(current_user['id'], 'create_guild'):
-            return jsonify({"error": "You don't have permission to create a guild"}), 403
-        guild = request.json
-        guild['id'] = str(uuid.uuid4())
-        guild['owner_id'] = current_user['id']
-        db['guilds'].append(guild)
-        save_db(db)
-        log_activity(current_user['id'], 'guild_created', {'guild_id': guild['id']})
-        return jsonify(guild), 201
-@app.route('/guilds/<guild_id>/settings', methods=['GET', 'PUT'])
-@token_required
-def guild_settings(current_user, guild_id):
-    db = load_db()
-    guild = next((g for g in db['guilds'] if g['id'] == guild_id), None)
-    if not guild:
-        return jsonify({"error": "Guild not found"}), 404
-
-    if not has_permission(current_user['id'], 'manage_guild', guild_id=guild_id):
-        return jsonify({"error": "You don't have permission to manage this guild"}), 403
-
-    if request.method == 'GET':
-        return jsonify({
-            'name': guild['name'],
-            'icon': guild.get('icon'),
-            'owner_id': guild['owner_id'],
-            'region': guild.get('region'),
-            'verification_level': guild.get('verification_level', 0),
-            'default_notifications': guild.get('default_notifications', 'all_messages'),
-            'explicit_content_filter': guild.get('explicit_content_filter', 'disabled'),
-            'afk_timeout': guild.get('afk_timeout', 300),
-            'afk_channel_id': guild.get('afk_channel_id')
-        })
-    elif request.method == 'PUT':
-        guild['name'] = request.json.get('name', guild['name'])
-        guild['icon'] = request.json.get('icon', guild.get('icon'))
-        guild['region'] = request.json.get('region', guild.get('region'))
-        guild['verification_level'] = request.json.get('verification_level', guild.get('verification_level', 0))
-        guild['default_notifications'] = request.json.get('default_notifications', guild.get('default_notifications', 'all_messages'))
-        guild['explicit_content_filter'] = request.json.get('explicit_content_filter', guild.get('explicit_content_filter', 'disabled'))
-        guild['afk_timeout'] = request.json.get('afk_timeout', guild.get('afk_timeout', 300))
-        guild['afk_channel_id'] = request.json.get('afk_channel_id', guild.get('afk_channel_id'))
-        save_db(db)
-        log_activity(current_user['id'], 'guild_settings_updated', {'guild_id': guild_id})
-        return jsonify(guild), 200
-@app.route('/search', methods=['GET'])
-@token_required
-def search(current_user):
-    query = request.args.get('q', '')
-    search_type = request.args.get('type', 'all')
-    
-    if search_type == 'messages':
-        result = es.search(index="messages", body={"query": {"match": {"content": query}}})
-    elif search_type == 'users':
-        result = es.search(index="users", body={"query": {"match": {"username": query}}})
-    elif search_type == 'channels':
-        result = es.search(index="channels", body={"query": {"match": {"name": query}}})
-    else:
-        result = es.multi_search(
-            index=["messages", "users", "channels"],
-            body=[
-                {},
-                {"query": {"match": {"content": query}}},
-                {},
-                {"query": {"match": {"username": query}}},
-                {},
-                {"query": {"match": {"name": query}}}
-            ]
-        )
-    
-    return jsonify(result['hits']['hits'])
-
-@app.route('/roles', methods=['GET', 'POST'])
-@token_required
-def roles(current_user):
-    db = load_db()
-    if request.method == 'GET':
-        return jsonify(db.get('roles', []))
-    elif request.method == 'POST':
-        if not has_permission(current_user['id'], 'manage_roles'):
-            return jsonify({"error": translate("You don't have permission to manage roles")}), 403
-        new_role = {
-            'id': str(uuid.uuid4()),
-            'name': request.json['name'],
-            'color': request.json.get('color'),
-            'permissions': request.json['permissions'],
-            'position': request.json['position'],
-            'created_by': current_user['id'],
-            'created_at': datetime.utcnow().isoformat()
-        }
-        if 'roles' not in db:
-            db['roles'] = []
-        db['roles'].append(new_role)
-        save_db(db)
-        log_activity(current_user['id'], 'role_created', {'role_id': new_role['id']})
-        return jsonify(new_role), 201
-@app.route('/events', methods=['GET', 'POST'])
-@token_required
-def events(current_user):
-    db = load_db()
-    if request.method == 'GET':
-        return jsonify(db.get('events', []))
-    elif request.method == 'POST':
-        new_event = {
-            'id': str(uuid.uuid4()),
-            'title': request.json['title'],
-            'description': request.json['description'],
-            'start_time': request.json['start_time'],
-            'end_time': request.json['end_time'],
-            'created_by': current_user['id'],
-            'created_at': datetime.utcnow().isoformat(),
-            'participants': [current_user['id']]
-        }
-        if 'events' not in db:
-            db['events'] = []
-        db['events'].append(new_event)
-        save_db(db)
-        log_activity(current_user['id'], 'event_created', {'event_id': new_event['id']})
-        return jsonify(new_event), 201
-
-@app.route('/events/<event_id>/participate', methods=['POST'])
-@token_required
-def participate_event(current_user, event_id):
-    db = load_db()
-    event = next((e for e in db.get('events', []) if e['id'] == event_id), None)
-    if not event:
-        return jsonify({"error": translate("Event not found")}), 404
-
-    if current_user['id'] not in event['participants']:
-        event['participants'].append(current_user['id'])
-        save_db(db)
-        log_activity(current_user['id'], 'event_joined', {'event_id': event_id})
-    return jsonify(event), 200
-
-@app.route('/emojis', methods=['GET', 'POST'])
-@token_required
-def emojis(current_user):
-    db = load_db()
-    if request.method == 'GET':
-        return jsonify(db.get('emojis', []))
-    elif request.method == 'POST':
-        if not has_permission(current_user['id'], 'manage_emojis'):
-            return jsonify({"error": translate("You don't have permission to manage emojis")}), 403
-        new_emoji = {
-            'id': str(uuid.uuid4()),
-            'name': request.json['name'],
-            'image_url': request.json['image_url'],
-            'created_by': current_user['id'],
-            'created_at': datetime.utcnow().isoformat()
-        }
-        if 'emojis' not in db:
-            db['emojis'] = []
-        db['emojis'].append(new_emoji)
-        save_db(db)
-        log_activity(current_user['id'], 'emoji_created', {'emoji_id': new_emoji['id']})
-        return jsonify(new_emoji), 201
-
-@app.route('/stickers', methods=['GET', 'POST'])
-@token_required
-def stickers(current_user):
-    db = load_db()
-    if request.method == 'GET':
-        return jsonify(db.get('stickers', []))
-    elif request.method == 'POST':
-        if not has_permission(current_user['id'], 'manage_stickers'):
-            return jsonify({"error": translate("You don't have permission to manage stickers")}), 403
-        new_sticker = {
-            'id': str(uuid.uuid4()),
-            'name': request.json['name'],
-            'image_url': request.json['image_url'],
-            'created_by': current_user['id'],
-            'created_at': datetime.utcnow().isoformat()
-        }
-        if 'stickers' not in db:
-            db['stickers'] = []
-        db['stickers'].append(new_sticker)
-        save_db(db)
-        log_activity(current_user['id'], 'sticker_created', {'sticker_id': new_sticker['id']})
-        return jsonify(new_sticker), 201
-
-@app.route('/bots', methods=['GET', 'POST'])
-@token_required
-def bots(current_user):
-    db = load_db()
-    if request.method == 'GET':
-        return jsonify(db.get('bots', []))
-    elif request.method == 'POST':
-        if not has_permission(current_user['id'], 'manage_bots'):
-            return jsonify({"error": translate("You don't have permission to manage bots")}), 403
-        new_bot = {
-            'id': str(uuid.uuid4()),
-            'name': request.json['name'],
-            'avatar': request.json.get('avatar'),
-            'token': str(uuid.uuid4()),
-            'created_by': current_user['id'],
-            'created_at': datetime.utcnow().isoformat()
-        }
-        if 'bots' not in db:
-            db['bots'] = []
-        db['bots'].append(new_bot)
-        save_db(db)
-        log_activity(current_user['id'], 'bot_created', {'bot_id': new_bot['id']})
-        return jsonify(new_bot), 201
-
-@app.route('/bots/<bot_id>/commands', methods=['GET', 'POST'])
-@token_required
-def bot_commands(current_user, bot_id):
-    db = load_db()
-    bot = next((b for b in db.get('bots', []) if b['id'] == bot_id), None)
-    if not bot:
-        return jsonify({"error": translate("Bot not found")}), 404
-
-    if request.method == 'GET':
-        return jsonify(bot.get('commands', []))
-    elif request.method == 'POST':
-        if not has_permission(current_user['id'], 'manage_bots') and current_user['id'] != bot['created_by']:
-            return jsonify({"error": translate("You don't have permission to manage this bot")}), 403
-        new_command = {
-            'id': str(uuid.uuid4()),
-            'name': request.json['name'],
-            'description': request.json['description'],
-            'usage': request.json['usage']
-        }
-        if 'commands' not in bot:
-            bot['commands'] = []
-        bot['commands'].append(new_command)
-        save_db(db)
-        log_activity(current_user['id'], 'bot_command_created', {'bot_id': bot_id, 'command_id': new_command['id']})
-        return jsonify(new_command), 201
-
-@app.route('/statistics/users/<user_id>', methods=['GET'])
-@token_required
-def user_statistics(current_user, user_id):
-    db = load_db()
-    user = next((u for u in db['users'] if u['id'] == user_id), None)
+    user = find_user(db, username)
     if not user:
-        return jsonify({"error": translate("User not found")}), 404
-
-    messages = [m for m in db['messages'] if m['author_id'] == user_id]
+        return jsonify({"status": "error", "message": "User not found"}), 404
     return jsonify({
-        'total_messages': len(messages),
-        'guilds_joined': len(set(m['guild_id'] for m in messages)),
-        'first_message_date': min(m['timestamp'] for m in messages) if messages else None,
-        'last_message_date': max(m['timestamp'] for m in messages) if messages else None
+        "username": user['username'],
+        "online": user['online'],
+        "friends": user['friends'],
+        "guilds": user['guilds'],
+        "dm_channels": user['dm_channels'],
+        "avatar_url": user['avatar_url']
     })
-def send_notification(user_id, message):
-    # In a real application, this would send a push notification or email
-    print(f"Sending notification to user {user_id}: {message}")
 
-@app.route('/notifications/settings', methods=['GET', 'PUT'])
-@token_required
-def notification_settings(current_user):
+# /users [GET]
+@app.route('/users', methods=['GET'])
+def list_users():
     db = load_db()
-    if request.method == 'GET':
-        return jsonify(current_user.get('notification_settings', {}))
-    elif request.method == 'PUT':
-        current_user['notification_settings'] = request.json
-        save_db(db)
-        return jsonify(current_user['notification_settings']), 200
-
-@socketio.on('update_status')
-def update_status(data):
-    db = load_db()
-    user = next((u for u in db['users'] if u['id'] == request.sid), None)
-    if user:
-        user['status'] = data['status']
-        user['game_activity'] = data.get('game_activity')
-        save_db(db)
-        emit('user_status_updated', {
-            'user_id': user['id'],
-            'status': user['status'],
-            'game_activity': user['game_activity']
-        }, broadcast=True)
-
-def check_scheduled_events():
-    db = load_db()
-    now = datetime.utcnow()
-    for event in db.get('scheduled_events', []):
-        if datetime.fromisoformat(event['scheduled_time']) <= now and not event.get('notified'):
-            for user_id in event['participants']:
-                send_notification(user_id, f"Event '{event['name']}' is starting now!")
-            event['notified'] = True
-    save_db(db)
-@app.route('/statistics/guilds/<guild_id>', methods=['GET'])
-@token_required
-def guild_statistics(current_user, guild_id):
-    db = load_db()
-    guild = next((g for g in db['guilds'] if g['id'] == guild_id), None)
-    if not guild:
-        return jsonify({"error": translate("Guild not found")}), 404
-
-    if not has_permission(current_user['id'], 'view_guild_stats', guild_id=guild_id):
-        return jsonify({"error": translate("You don't have permission to view guild statistics")}), 403
-
-    messages = [m for m in db['messages'] if m['guild_id'] == guild_id]
-    return jsonify({
-        'total_messages': len(messages),
-        'active_users': len(set(m['author_id'] for m in messages)),
-        'most_active_channel': max(set(m['channel_id'] for m in messages), key=lambda c: len([m for m in messages if m['channel_id'] == c])),
-        'messages_per_day': len(messages) / ((datetime.utcnow() - datetime.fromisoformat(guild['created_at'])).days or 1)
-    })
-@app.route('/guilds/<guild_id>/webhooks', methods=['GET', 'POST'])
-@token_required
-def guild_webhooks(current_user, guild_id):
-    db = load_db()
-    guild = next((g for g in db['guilds'] if g['id'] == guild_id), None)
-    if not guild:
-        return jsonify({"error": "Guild not found"}), 404
-
-    if not has_permission(current_user['id'], 'manage_webhooks', guild_id=guild_id):
-        return jsonify({"error": "You don't have permission to manage webhooks in this guild"}), 403
-
-    if request.method == 'GET':
-        webhooks = [w for w in db.get('webhooks', []) if w['guild_id'] == guild_id]
-        return jsonify(webhooks)
-    elif request.method == 'POST':
-        new_webhook = {
-            'id': str(uuid.uuid4()),
-            'guild_id': guild_id,
-            'channel_id': request.json['channel_id'],
-            'name': request.json['name'],
-            'avatar': request.json.get('avatar'),
-            'token': str(uuid.uuid4()),
-            'created_by': current_user['id'],
-            'created_at': datetime.utcnow().isoformat()
-        }
-        if 'webhooks' not in db:
-            db['webhooks'] = []
-        db['webhooks'].append(new_webhook)
-        save_db(db)
-        log_activity(current_user['id'], 'webhook_created', {'guild_id': guild_id, 'webhook_id': new_webhook['id']})
-        return jsonify(new_webhook), 201
-
-@app.route('/webhooks/<webhook_id>', methods=['POST'])
-def execute_webhook(webhook_id):
-    db = load_db()
-    webhook = next((w for w in db.get('webhooks', []) if w['id'] == webhook_id), None)
-    if not webhook:
-        return jsonify({"error": "Webhook not found"}), 404
-
-    message = {
-        'id': str(uuid.uuid4()),
-        'channel_id': webhook['channel_id'],
-        'content': request.json['content'],
-        'author': {
-            'username': request.json.get('username', webhook['name']),
-            'avatar_url': request.json.get('avatar_url', webhook['avatar'])
-        },
-        'timestamp': datetime.utcnow().isoformat()
-    }
-    db['messages'].append(message)
-    save_db(db)
-    socketio.emit('new_message', message, room=webhook['channel_id'])
-    return '', 204
-
-def auto_moderate_message(message):
-    # Simple word filter
-    forbidden_words = ['badword1', 'badword2', 'badword3']
-    for word in forbidden_words:
-        if word in message['content'].lower():
-            return False
-    
-    # URL filter
-    urls = re.findall('http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', message['content'])
-    for url in urls:
-        response = requests.get(url)
-        if response.status_code != 200:
-            return False
-    
-    return True
-
-@app.route('/guilds/<guild_id>/channels', methods=['GET', 'POST'])
-@token_required
-def guild_channels(current_user, guild_id):
-    db = load_db()
-    if request.method == 'GET':
-        channels = [c for c in db['channels'] if c['guild_id'] == guild_id]
-        return jsonify(channels)
-    elif request.method == 'POST':
-        if not has_permission(current_user['id'], 'create_channel', guild_id=guild_id):
-            return jsonify({"error": "You don't have permission to create a channel in this guild"}), 403
-        channel = request.json
-        channel['id'] = str(uuid.uuid4())
-        channel['guild_id'] = guild_id
-        db['channels'].append(channel)
-        save_db(db)
-        log_activity(current_user['id'], 'channel_created', {'guild_id': guild_id, 'channel_id': channel['id']})
-        return jsonify(channel), 201
-
-@app.route('/channels/<channel_id>/messages', methods=['GET', 'POST'])
-@token_required
-def messages(current_user, channel_id):
-    db = load_db()
-    channel = next((c for c in db['channels'] if c['id'] == channel_id), None)
-    if not channel:
-        return jsonify({"error": "Channel not found"}), 404
-    
-    if request.method == 'GET':
-        if not has_permission(current_user['id'], 'read_messages', guild_id=channel['guild_id'], channel_id=channel_id):
-            return jsonify({"error": "You don't have permission to read messages in this channel"}), 403
-        channel_messages = [m for m in db['messages'] if m['channel_id'] == channel_id]
-        return jsonify(channel_messages)
-    elif request.method == 'POST':
-        if not has_permission(current_user['id'], 'send_messages', guild_id=channel['guild_id'], channel_id=channel_id):
-            return jsonify({"error": "You don't have permission to send messages in this channel"}), 403
-        message = request.json
-        message['id'] = str(uuid.uuid4())
-        message['user_id'] = current_user['id']
-        message['channel_id'] = channel_id
-        message['timestamp'] = datetime.utcnow().isoformat()
-        db['messages'].append(message)
-        save_db(db)
-        socketio.emit('new_message', message, room=channel_id)
-        log_activity(current_user['id'], 'message_sent', {'channel_id': channel_id, 'message_id': message['id']})
-        return jsonify(message), 201
-@app.route('/upload', methods=['POST'])
-@token_required
-def upload_file(current_user):
-    if 'file' not in request.files:
-        return jsonify({"error": translate("No file part")}), 400
-    file = request.files['file']
-    if file.filename == '':
-        return jsonify({"error": translate("No selected file")}), 400
-    if file and allowed_file(file.filename):
-        filename = secure_filename(file.filename)
-        unique_filename = f"{uuid.uuid4()}_{filename}"
-        file_path = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename)
-        file.save(file_path)
-        
-        # Upload to S3
-        try:
-            s3.upload_file(file_path, S3_BUCKET, unique_filename)
-            os.remove(file_path)  # Remove local file after successful S3 upload
-        except ClientError as e:
-            return jsonify({"error": str(e)}), 500
-
-        db = load_db()
-        new_file = {
-            'id': str(uuid.uuid4()),
-            'filename': unique_filename,
-            'original_filename': file.filename,
-            'uploader_id': current_user['id'],
-            'upload_date': datetime.utcnow().isoformat(),
-            'file_type': file.filename.rsplit('.', 1)[1].lower(),
-            's3_url': f"https://{S3_BUCKET}.s3.amazonaws.com/{unique_filename}"
-        }
-        if 'files' not in db:
-            db['files'] = []
-        db['files'].append(new_file)
-        save_db(db)
-        log_activity(current_user['id'], 'file_uploaded', {'file_id': new_file['id']})
-        return jsonify(new_file), 201
-    return jsonify({"error": translate("File type not allowed")}), 400
-
-@app.route('/files/<file_id>', methods=['GET'])
-@token_required
-def get_file(current_user, file_id):
-    db = load_db()
-    file = next((f for f in db.get('files', []) if f['id'] == file_id), None)
-    if not file:
-        return jsonify({"error": translate("File not found")}), 404
-    return jsonify(file), 200
-
-@app.route('/files/<file_id>/download', methods=['GET'])
-@token_required
-def download_file(current_user, file_id):
-    db = load_db()
-    file = next((f for f in db.get('files', []) if f['id'] == file_id), None)
-    if not file:
-        return jsonify({"error": translate("File not found")}), 404
-    
-    try:
-        response = s3.generate_presigned_url('get_object',
-                                             Params={'Bucket': S3_BUCKET,
-                                                     'Key': file['filename']},
-                                             ExpiresIn=3600)
-    except ClientError as e:
-        return jsonify({"error": str(e)}), 500
-
-    return jsonify({"download_url": response}), 200
-@app.route('/messages/<message_id>/reactions', methods=['POST', 'DELETE'])
-@token_required
-def message_reactions(current_user, message_id):
-    db = load_db()
-    message = next((m for m in db['messages'] if m['id'] == message_id), None)
-    if not message:
-        return jsonify({"error": "Message not found"}), 404
-    
-    channel = next((c for c in db['channels'] if c['id'] == message['channel_id']), None)
-    if not has_permission(current_user['id'], 'react_to_messages', guild_id=channel['guild_id'], channel_id=message['channel_id']):
-        return jsonify({"error": "You don't have permission to react to messages in this channel"}), 403
-    
-    if request.method == 'POST':
-        reaction = request.json['reaction']
-        new_reaction = {
-            'id': str(uuid.uuid4()),
-            'user_id': current_user['id'],
-            'message_id': message_id,
-            'reaction': reaction
-        }
-        db['reactions'].append(new_reaction)
-        save_db(db)
-        socketio.emit('new_reaction', new_reaction, room=message['channel_id'])
-        log_activity(current_user['id'], 'reaction_added', {'message_id': message_id, 'reaction': reaction})
-        return jsonify(new_reaction), 201
-    elif request.method == 'DELETE':
-        reaction = request.json['reaction']
-        db['reactions'] = [r for r in db['reactions'] if not (r['user_id'] == current_user['id'] and r['message_id'] == message_id and r['reaction'] == reaction)]
-        save_db(db)
-        socketio.emit('reaction_removed', {'user_id': current_user['id'], 'message_id': message_id, 'reaction': reaction}, room=message['channel_id'])
-        log_activity(current_user['id'], 'reaction_removed', {'message_id': message_id, 'reaction': reaction})
-        return '', 204
-@app.route('/users/<user_id>/profile', methods=['GET', 'PUT'])
-@token_required
-def user_profile(current_user, user_id):
-    db = load_db()
-    user = next((u for u in db['users'] if u['id'] == user_id), None)
-    if not user:
-        return jsonify({"error": translate("User not found")}), 404
-
-    if request.method == 'GET':
-        return jsonify({
-            'username': user['username'],
-            'avatar': user.get('avatar'),
-            'bio': user.get('bio'),
-            'created_at': user.get('created_at'),
-            'custom_status': user.get('custom_status'),
-            'badges': user.get('badges', []),
-            'theme': user.get('theme', 'light')
+    users_list = []
+    for u in db['users']:
+        users_list.append({
+            "username": u['username'],
+            "online": u['online'],
+            "avatar_url": u['avatar_url']
         })
-    elif request.method == 'PUT':
-        if current_user['id'] != user_id:
-            return jsonify({"error": translate("You can only edit your own profile")}), 403
-        user['bio'] = request.json.get('bio', user.get('bio'))
-        user['avatar'] = request.json.get('avatar', user.get('avatar'))
-        user['custom_status'] = request.json.get('custom_status', user.get('custom_status'))
-        user['theme'] = request.json.get('theme', user.get('theme'))
-        save_db(db)
-        log_activity(current_user['id'], 'profile_updated')
-        return jsonify(user), 200
-@app.route('/users/<user_id>/block', methods=['POST', 'DELETE'])
-@token_required
-def block_user(current_user, user_id):
-    db = load_db()
-    if request.method == 'POST':
-        new_block = {
-            'id': str(uuid.uuid4()),
-            'blocker_id': current_user['id'],
-            'blocked_id': user_id
-        }
-        db['blocked_users'].append(new_block)
-        save_db(db)
-        log_activity(current_user['id'], 'user_blocked', {'blocked_user_id': user_id})
-        return jsonify(new_block), 201
-    elif request.method == 'DELETE':
-        db['blocked_users'] = [b for b in db['blocked_users'] if not (b['blocker_id'] == current_user['id'] and b['blocked_id'] == user_id)]
-        save_db(db)
-        log_activity(current_user['id'], 'user_unblocked', {'unblocked_user_id': user_id})
-        return '', 204
+    return jsonify({"users": users_list})
 
-@app.route('/guilds/<guild_id>/roles', methods=['GET', 'POST'])
-@token_required
-def guild_roles(current_user, guild_id):
-    db = load_db()
-    guild = next((g for g in db['guilds'] if g['id'] == guild_id), None)
-    if not guild:
-        return jsonify({"error": "Guild not found"}), 404
-    
-    if request.method == 'GET':
-        roles = [r for r in db['roles'] if r['guild_id'] == guild_id]
-        return jsonify(roles)
-    elif request.method == 'POST':
-        if not has_permission(current_user['id'], 'manage_roles', guild_id=guild_id):
-            return jsonify({"error": "You don't have permission to manage roles in this guild"}), 403
-        role = request.json
-        role['id'] = str(uuid.uuid4())
-        role['guild_id'] = guild_id
-        db['roles'].append(role)
-        save_db(db)
-        log_activity(current_user['id'], 'role_created', {'guild_id': guild_id, 'role_id': role['id']})
-        return jsonify(role), 201
-
-
-@app.route('/users/<user_id>/roles', methods=['POST', 'DELETE'])
-@token_required
-def user_roles(current_user, user_id):
-    db = load_db()
-    user = next((u for u in db['users'] if u['id'] == user_id), None)
-    if not user:
-        return jsonify({"error": translate("User not found")}), 404
-
-    if not has_permission(current_user['id'], 'manage_roles'):
-        return jsonify({"error": translate("You don't have permission to manage roles")}), 403
-
-    if request.method == 'POST':
-        role_id = request.json['role_id']
-        if 'roles' not in user:
-            user['roles'] = []
-        if role_id not in user['roles']:
-            user['roles'].append(role_id)
-            save_db(db)
-            log_activity(current_user['id'], 'role_assigned', {'user_id': user_id, 'role_id': role_id})
-        return jsonify(user['roles']), 200
-    elif request.method == 'DELETE':
-        role_id = request.json['role_id']
-        if 'roles' in user and role_id in user['roles']:
-            user['roles'].remove(role_id)
-            save_db(db)
-            log_activity(current_user['id'], 'role_removed', {'user_id': user_id, 'role_id': role_id})
-        return jsonify(user['roles']), 200
-@app.route('/marketplace', methods=['GET'])
-@token_required
-def marketplace(current_user):
-    db = load_db()
-    return jsonify(db.get('integrations', []))
-
-@app.route('/marketplace/<integration_id>', methods=['POST'])
-@token_required
-def install_integration(current_user, integration_id):
-    db = load_db()
-    integration = next((i for i in db.get('integrations', []) if i['id'] == integration_id), None)
-    if not integration:
-        return jsonify({"error": translate("Integration not found")}), 404
-
-    if 'installed_integrations' not in current_user:
-        current_user['installed_integrations'] = []
-    current_user['installed_integrations'].append(integration_id)
-    save_db(db)
-    log_activity(current_user['id'], 'integration_installed', {'integration_id': integration_id})
-    return jsonify({"message": translate("Integration installed successfully")}), 200
-
-@app.route('/polls', methods=['GET', 'POST'])
-@token_required
-def polls(current_user):
-    db = load_db()
-    if request.method == 'GET':
-        return jsonify(db.get('polls', []))
-    elif request.method == 'POST':
-        new_poll = {
-            'id': str(uuid.uuid4()),
-            'question': request.json['question'],
-            'options': request.json['options'],
-            'created_by': current_user['id'],
-            'created_at': datetime.utcnow().isoformat(),
-            'expires_at': (datetime.utcnow() + timedelta(days=request.json.get('duration_days', 1))).isoformat(),
-            'votes': {}
-        }
-        if 'polls' not in db:
-            db['polls'] = []
-        db['polls'].append(new_poll)
-        save_db(db)
-        log_activity(current_user['id'], 'poll_created', {'poll_id': new_poll['id']})
-        return jsonify(new_poll), 201
-
-@app.route('/polls/<poll_id>/vote', methods=['POST'])
-@token_required
-def vote_poll(current_user, poll_id):
-    db = load_db()
-    poll = next((p for p in db.get('polls', []) if p['id'] == poll_id), None)
-    if not poll:
-        return jsonify({"error": translate("Poll not found")}), 404
-
-    if datetime.fromisoformat(poll['expires_at']) < datetime.utcnow():
-        return jsonify({"error": translate("This poll has expired")}), 400
-
-    option = request.json['option']
-    if option not in poll['options']:
-        return jsonify({"error": translate("Invalid option")}), 400
-
-    poll['votes'][current_user['id']] = option
-    save_db(db)
-    log_activity(current_user['id'], 'poll_voted', {'poll_id': poll_id, 'option': option})
-    return jsonify({"message": translate("Vote recorded successfully")}), 200
-
-@app.route('/reports', methods=['POST'])
-@token_required
-def create_report(current_user):
-    db = load_db()
-    new_report = {
-        'id': str(uuid.uuid4()),
-        'reporter_id': current_user['id'],
-        'reported_id': request.json['reported_id'],
-        'reason': request.json['reason'],
-        'details': request.json.get('details'),
-        'status': 'open',
-        'created_at': datetime.utcnow().isoformat()
+##########################
+# Profil Güncelleme (GIF Avatar / Banner)
+##########################
+@app.route('/update_profile', methods=['POST'])
+def update_profile():
+    """
+    Avatar ve banner güncellemesi (GIF dahil).
+    Body: {
+      "avatar_url":"(gif veya normal url)",
+      "banner_url":"(gif veya normal url)"
     }
-    if 'reports' not in db:
-        db['reports'] = []
-    db['reports'].append(new_report)
+    """
+    db = load_db()
+    auth = request.headers.get('Authorization')
+    if not auth or not auth.startswith("Bearer "):
+        return jsonify({"status":"error","message":"Unauthorized"}),401
+    token = auth.split(" ")[1]
+    cu = find_user_by_token(db, token)
+    if not cu:
+        return jsonify({"status":"error","message":"Invalid token"}),401
+
+    data = request.get_json()
+    new_avatar = data.get('avatar_url', None)
+    new_banner = data.get('banner_url', None)
+
+    if new_avatar:
+        if not (new_avatar.startswith("http://") or new_avatar.startswith("https://")):
+            return jsonify({"status":"error","message":"Invalid avatar URL"}),400
+        cu['avatar_url'] = new_avatar
+
+    if new_banner:
+        if not (new_banner.startswith("http://") or new_banner.startswith("https://")):
+            return jsonify({"status":"error","message":"Invalid banner URL"}),400
+        # banner_url alanını ekleyelim (yoksa ek oluştur)
+        cu['banner_url'] = new_banner
+
     save_db(db)
-    log_activity(current_user['id'], 'report_created', {'report_id': new_report['id']})
-    return jsonify(new_report), 201
+    return jsonify({"status":"success","message":"Profile updated"})
 
-@app.route('/reports', methods=['GET'])
-@token_required
-def get_reports(current_user):
-    if not has_permission(current_user['id'], 'view_reports'):
-        return jsonify({"error": translate("You don't have permission to view reports")}), 403
+##########################
+# Arkadaşlık Sistemi     #
+##########################
+
+# /send_friend_request [POST]
+# Body: {"to_user":"..."}
+@app.route('/send_friend_request', methods=['POST'])
+def send_friend_request():
     db = load_db()
-    return jsonify(db.get('reports', []))
+    auth = request.headers.get('Authorization')
+    if not auth or not auth.startswith("Bearer "):
+        return jsonify({"status": "error", "message": "Unauthorized"}), 401
+    token = auth.split(" ")[1]
+    from_user = find_user_by_token(db, token)
+    if not from_user:
+        return jsonify({"status": "error", "message": "Invalid token"}), 401
 
-@app.route('/reports/<report_id>', methods=['PUT'])
-@token_required
-def update_report(current_user, report_id):
-    if not has_permission(current_user['id'], 'manage_reports'):
-        return jsonify({"error": translate("You don't have permission to manage reports")}), 403
-    db = load_db()
-    report = next((r for r in db.get('reports', []) if r['id'] == report_id), None)
-    if not report:
-        return jsonify({"error": translate("Report not found")}), 404
+    data = request.get_json()
+    to_username = data.get('to_user')
+    to_user = find_user(db, to_username)
+    if not to_user:
+        return jsonify({"status":"error","message":"User not found"}),404
 
-    report['status'] = request.json['status']
-    report['resolved_by'] = current_user['id']
-    report['resolved_at'] = datetime.utcnow().isoformat()
-    save_db(db)
-    log_activity(current_user['id'], 'report_updated', {'report_id': report_id})
-    return jsonify(report), 200
+    if to_user['username'] in from_user['friends']:
+        return jsonify({"status":"error","message":"Already friends"}),400
 
-@app.route('/guilds/<guild_id>/bans', methods=['GET', 'POST', 'DELETE'])
-@token_required
-def guild_bans(current_user, guild_id):
-    db = load_db()
-    guild = next((g for g in db['guilds'] if g['id'] == guild_id), None)
-    if not guild:
-        return jsonify({"error": "Guild not found"}), 404
+    for fr in db['friend_requests']:
+        if fr['from'] == from_user['username'] and fr['to'] == to_user['username']:
+            return jsonify({"status":"error","message":"Request already sent"}),400
 
-    if request.method == 'GET':
-        if not has_permission(current_user['id'], 'view_bans', guild_id=guild_id):
-            return jsonify({"error": "You don't have permission to view bans in this guild"}), 403
-        bans = [b for b in db.get('bans', []) if b['guild_id'] == guild_id]
-        return jsonify(bans)
-    elif request.method == 'POST':
-        if not has_permission(current_user['id'], 'ban_members', guild_id=guild_id):
-            return jsonify({"error": "You don't have permission to ban members in this guild"}), 403
-        user_id = request.json['user_id']
-        reason = request.json.get('reason', '')
-        new_ban = {
-            'id': str(uuid.uuid4()),
-            'guild_id': guild_id,
-            'user_id': user_id,
-            'banned_by': current_user['id'],
-            'reason': reason,
-            'timestamp': datetime.utcnow().isoformat()
-        }
-        if 'bans' not in db:
-            db['bans'] = []
-        db['bans'].append(new_ban)
-        save_db(db)
-        log_activity(current_user['id'], 'user_banned', {'guild_id': guild_id, 'banned_user_id': user_id})
-        return jsonify(new_ban), 201
-    elif request.method == 'DELETE':
-        if not has_permission(current_user['id'], 'unban_members', guild_id=guild_id):
-            return jsonify({"error": "You don't have permission to unban members in this guild"}), 403
-        user_id = request.json['user_id']
-        db['bans'] = [b for b in db.get('bans', []) if not (b['guild_id'] == guild_id and b['user_id'] == user_id)]
-        save_db(db)
-        log_activity(current_user['id'], 'user_unbanned', {'guild_id': guild_id, 'unbanned_user_id': user_id})
-        return '', 204
-
-@app.route('/channels/<channel_id>/pins', methods=['GET', 'POST', 'DELETE'])
-@token_required
-def channel_pins(current_user, channel_id):
-    db = load_db()
-    channel = next((c for c in db['channels'] if c['id'] == channel_id), None)
-    if not channel:
-        return jsonify({"error": "Channel not found"}), 404
-
-    if request.method == 'GET':
-        if not has_permission(current_user['id'], 'read_messages', guild_id=channel['guild_id'], channel_id=channel_id):
-            return jsonify({"error": "You don't have permission to view pins in this channel"}), 403
-        pins = [m for m in db['messages'] if m['channel_id'] == channel_id and m.get('pinned', False)]
-        return jsonify(pins)
-    elif request.method == 'POST':
-        if not has_permission(current_user['id'], 'manage_messages', guild_id=channel['guild_id'], channel_id=channel_id):
-            return jsonify({"error": "You don't have permission to pin messages in this channel"}), 403
-        message_id = request.json['message_id']
-        message = next((m for m in db['messages'] if m['id'] == message_id and m['channel_id'] == channel_id), None)
-        if not message:
-            return jsonify({"error": "Message not found"}), 404
-        message['pinned'] = True
-        save_db(db)
-        log_activity(current_user['id'], 'message_pinned', {'channel_id': channel_id, 'message_id': message_id})
-        return jsonify(message), 200
-    elif request.method == 'DELETE':
-        if not has_permission(current_user['id'], 'manage_messages', guild_id=channel['guild_id'], channel_id=channel_id):
-            return jsonify({"error": "You don't have permission to unpin messages in this channel"}), 403
-        message_id = request.json['message_id']
-        message = next((m for m in db['messages'] if m['id'] == message_id and m['channel_id'] == channel_id), None)
-        if not message:
-            return jsonify({"error": "Message not found"}), 404
-        message['pinned'] = False
-        save_db(db)
-        log_activity(current_user['id'], 'message_unpinned', {'channel_id': channel_id, 'message_id': message_id})
-        return '', 204
-@app.route('/achievements', methods=['GET'])
-@token_required
-def get_achievements(current_user):
-    db = load_db()
-    return jsonify(db.get('achievements', []))
-
-@app.route('/users/<user_id>/badges', methods=['GET'])
-@token_required
-def get_user_badges(current_user, user_id):
-    db = load_db()
-    user = next((u for u in db['users'] if u['id'] == user_id), None)
-    if not user:
-        return jsonify({"error": translate("User not found")}), 404
-    return jsonify(user.get('badges', []))
-
-def check_achievements(user_id):
-    db = load_db()
-    user = next((u for u in db['users'] if u['id'] == user_id), None)
-    if not user:
-        return
-
-    user_messages = [m for m in db['messages'] if m['author_id'] == user_id]
-    
-    # Example achievement: Sent 100 messages
-    if len(user_messages) >= 100 and 'centurion' not in user.get('badges', []):
-        user.setdefault('badges', []).append('centurion')
-        save_db(db)
-        socketio.emit('achievement_unlocked', {'user_id': user_id, 'badge': 'centurion'}, room=user_id)
-
-@app.route('/analytics/users', methods=['GET'])
-@token_required
-def user_analytics(current_user):
-    if not has_permission(current_user['id'], 'view_analytics'):
-        return jsonify({"error": translate("You don't have permission to view analytics")}), 403
-
-    db = load_db()
-    users = db['users']
-    
-    # User growth over time
-    user_growth = pd.DataFrame(users)
-    user_growth['created_at'] = pd.to_datetime(user_growth['created_at'])
-    user_growth = user_growth.resample('D', on='created_at').size().cumsum()
-    
-    plt.figure(figsize=(10, 5))
-    sns.lineplot(data=user_growth)
-    plt.title('User Growth Over Time')
-    plt.xlabel('Date')
-    plt.ylabel('Total Users')
-    plt.savefig('user_growth.png')
-    plt.close()
-
-    # Active users per day
-    messages = db['messages']
-    active_users = pd.DataFrame(messages)
-    active_users['timestamp'] = pd.to_datetime(active_users['timestamp'])
-    active_users = active_users.groupby(active_users['timestamp'].dt.date)['author_id'].nunique()
-
-    plt.figure(figsize=(10, 5))
-    sns.lineplot(data=active_users)
-    plt.title('Active Users per Day')
-    plt.xlabel('Date')
-    plt.ylabel('Active Users')
-    plt.savefig('active_users.png')
-    plt.close()
-
-    return jsonify({
-        "user_growth_chart": "user_growth.png",
-        "active_users_chart": "active_users.png",
-        "total_users": len(users),
-        "average_daily_active_users": active_users.mean()
-    }), 200
-@app.route('/guilds/<guild_id>/invites', methods=['GET', 'POST'])
-@token_required
-def guild_invites(current_user, guild_id):
-    db = load_db()
-    guild = next((g for g in db['guilds'] if g['id'] == guild_id), None)
-    if not guild:
-        return jsonify({"error": "Guild not found"}), 404
-
-    if request.method == 'GET':
-        if not has_permission(current_user['id'], 'manage_guild', guild_id=guild_id):
-            return jsonify({"error": "You don't have permission to view invites in this guild"}), 403
-        invites = [i for i in db.get('invites', []) if i['guild_id'] == guild_id]
-        return jsonify(invites)
-    elif request.method == 'POST':
-        if not has_permission(current_user['id'], 'create_invite', guild_id=guild_id):
-            return jsonify({"error": "You don't have permission to create invites in this guild"}), 403
-        new_invite = {
-            'id': str(uuid.uuid4()),
-            'guild_id': guild_id,
-            'created_by': current_user['id'],
-            'code': ''.join(random.choices(string.ascii_uppercase + string.digits, k=8)),
-            'created_at': datetime.utcnow().isoformat(),
-            'expires_at': (datetime.utcnow() + timedelta(days=7)).isoformat()  # Default expiry of 7 days
-        }
-        if 'invites' not in db:
-            db['invites'] = []
-        db['invites'].append(new_invite)
-        save_db(db)
-        log_activity(current_user['id'], 'invite_created', {'guild_id': guild_id, 'invite_code': new_invite['code']})
-        return jsonify(new_invite), 201
-
-@app.route('/invites/<invite_code>', methods=['GET'])
-def join_guild(invite_code):
-    db = load_db()
-    invite = next((i for i in db.get('invites', []) if i['code'] == invite_code), None)
-    if not invite:
-        return jsonify({"error": "Invalid invite code"}), 404
-    if datetime.fromisoformat(invite['expires_at']) < datetime.utcnow():
-        return jsonify({"error": "Invite has expired"}), 400
-    # Here you would typically add the user to the guild
-    # For simplicity, we'll just return the guild information
-    guild = next((g for g in db['guilds'] if g['id'] == invite['guild_id']), None)
-    return jsonify(guild), 200
-
-@socketio.on('typing')
-def on_typing(data):
-    channel_id = data['channel_id']
-    emit('user_typing', {'user_id': request.sid}, room=channel_id)
-
-@socketio.on('stop_typing')
-def on_stop_typing(data):
-    channel_id = data['channel_id']
-    emit('user_stop_typing', {'user_id': request.sid}, room=channel_id)
-
-@socketio.on('send_message')
-def handle_message(data):
-    db = load_db()
-    message = {
-        'id': str(uuid.uuid4()),
-        'channel_id': data['channel_id'],
-        'author_id': request.sid,
-        'content': data['content'],
-        'timestamp': datetime.utcnow().isoformat()
+    new_req = {
+        "id": str(uuid.uuid4()),
+        "from": from_user['username'],
+        "to": to_user['username']
     }
-    
-    if auto_moderate_message(message):
-        db['messages'].append(message)
+    db['friend_requests'].append(new_req)
+    save_db(db)
+    return jsonify({"status":"success","message":"Friend request sent"})
+
+
+# /friend_requests [GET]
+@app.route('/friend_requests', methods=['GET'])
+def friend_requests():
+    db = load_db()
+    auth = request.headers.get('Authorization')
+    if not auth or not auth.startswith("Bearer "):
+        return jsonify({"status":"error","message":"Unauthorized"}),401
+    token = auth.split(" ")[1]
+    user = find_user_by_token(db, token)
+    if not user:
+        return jsonify({"status":"error","message":"Invalid token"}),401
+
+    incoming = [fr for fr in db['friend_requests'] if fr['to'] == user['username']]
+    return jsonify({"friend_requests": incoming})
+
+
+# /respond_friend_request [POST]
+# Body: {"request_id":"...","action":"accept"|"reject"}
+@app.route('/respond_friend_request', methods=['POST'])
+def respond_friend_request():
+    db = load_db()
+    auth = request.headers.get('Authorization')
+    if not auth or not auth.startswith("Bearer "):
+        return jsonify({"status":"error","message":"Unauthorized"}),401
+    token = auth.split(" ")[1]
+    current_user = find_user_by_token(db, token)
+    if not current_user:
+        return jsonify({"status":"error","message":"Invalid token"}),401
+
+    data = request.get_json()
+    req_id = data.get('request_id')
+    action = data.get('action')
+    fr_index = None
+    fr = None
+    for i, r in enumerate(db['friend_requests']):
+        if r['id'] == req_id:
+            fr = r
+            fr_index = i
+            break
+
+    if not fr:
+        return jsonify({"status":"error","message":"Request not found"}),404
+
+    if fr['to'] != current_user['username']:
+        return jsonify({"status":"error","message":"Not your request"}),403
+
+    if action == "accept":
+        from_user = find_user(db, fr['from'])
+        to_user = current_user
+        from_user['friends'].append(to_user['username'])
+        to_user['friends'].append(from_user['username'])
+        del db['friend_requests'][fr_index]
         save_db(db)
-        emit('new_message', message, room=data['channel_id'])
+        return jsonify({"status":"success","message":"Friend added"})
+    elif action == "reject":
+        del db['friend_requests'][fr_index]
+        save_db(db)
+        return jsonify({"status":"success","message":"Friend request rejected"})
     else:
-        emit('message_blocked', {'error': 'Your message was blocked by auto-moderation'}, room=request.sid)
+        return jsonify({"status":"error","message":"Invalid action"}),400
 
-@socketio.on('join_voice')
-def on_join_voice(data):
-    room = f"voice_{data['channel_id']}"
-    join_room(room)
-    emit('user_joined_voice', {'user_id': request.sid}, room=room)
+# /friends [GET]
+@app.route('/friends', methods=['GET'])
+def friends_list():
+    db = load_db()
+    auth = request.headers.get('Authorization')
+    if not auth or not auth.startswith("Bearer "):
+        return jsonify({"status":"error","message":"Unauthorized"}),401
+    token = auth.split(" ")[1]
+    user = find_user_by_token(db, token)
+    if not user:
+        return jsonify({"status":"error","message":"Invalid token"}),401
 
-@socketio.on('leave_voice')
-def on_leave_voice(data):
-    room = f"voice_{data['channel_id']}"
-    leave_room(room)
-    emit('user_left_voice', {'user_id': request.sid}, room=room)
+    friends_data = []
+    for f in user['friends']:
+        fu = find_user(db, f)
+        friends_data.append({
+            "username": fu['username'],
+            "online": fu['online']
+        })
+    return jsonify({"friends": friends_data})
 
-@socketio.on('start_video')
-def on_start_video(data):
-    room = f"video_{data['channel_id']}"
-    join_room(room)
-    emit('user_started_video', {'user_id': request.sid}, room=room)
+##########################
+# DM (Özel Mesaj)        #
+##########################
 
-@socketio.on('stop_video')
-def on_stop_video(data):
-    room = f"video_{data['channel_id']}"
-    leave_room(room)
-    emit('user_stopped_video', {'user_id': request.sid}, room=room)
-@socketio.on('voice_state')
-def handle_voice_state(data):
-    room = f"voice_{data['channel_id']}"
-    emit('voice_state_update', {
-        'user_id': request.sid,
-        'speaking': data['speaking'],
-        'muted': data['muted'],
-        'deafened': data['deafened']
-    }, room=room)
-def run_schedule():
-    while True:
-        schedule.run_pending()
-        time.sleep(60)
+# /create_dm [POST]
+# Body: {"with_user":"..."}
+@app.route('/create_dm', methods=['POST'])
+def create_dm():
+    db = load_db()
+    auth = request.headers.get('Authorization')
+    if not auth or not auth.startswith("Bearer "):
+        return jsonify({"status":"error","message":"Unauthorized"}),401
+    token = auth.split(" ")[1]
+    current_user = find_user_by_token(db, token)
+    if not current_user:
+        return jsonify({"status":"error","message":"Invalid token"}),401
 
-schedule.every(1).minutes.do(check_scheduled_events)
-threading.Thread(target=run_schedule, daemon=True).start()
+    data = request.get_json()
+    with_user = data.get('with_user')
+    other_user = find_user(db, with_user)
+    if not other_user:
+        return jsonify({"status":"error","message":"User not found"}),404
+
+    if other_user['username'] not in current_user['friends']:
+        return jsonify({"status":"error","message":"You can only DM friends"}),403
+
+    for dm in db['direct_messages']:
+        if set(dm['participants']) == set([current_user['username'], other_user['username']]):
+            return jsonify({"status":"success","dm_id":dm['id'],"message":"DM already exists"})
+
+    dm_id = str(uuid.uuid4())
+    new_dm = {
+        "id": dm_id,
+        "participants": [current_user['username'], other_user['username']],
+        "messages": []
+    }
+    db['direct_messages'].append(new_dm)
+    current_user['dm_channels'].append(dm_id)
+    other_user['dm_channels'].append(dm_id)
+    save_db(db)
+    return jsonify({"status":"success","dm_id":dm_id})
+
+# /send_dm [POST]
+# Body: {"dm_id":"...","content":"...","file_base64":"optional"}
+@app.route('/send_dm', methods=['POST'])
+def send_dm():
+    db = load_db()
+    auth = request.headers.get('Authorization')
+    if not auth or not auth.startswith("Bearer "):
+        return jsonify({"status":"error","message":"Unauthorized"}),401
+    token = auth.split(" ")[1]
+    cu = find_user_by_token(db, token)
+    if not cu:
+        return jsonify({"status":"error","message":"Invalid token"}),401
+
+    data = request.get_json()
+    dm_id = data.get('dm_id')
+    content = data.get('content')
+    file_base64 = data.get('file_base64', None)
+    dm_obj = find_dm(db, dm_id)
+    if not dm_obj:
+        return jsonify({"status":"error","message":"DM not found"}),404
+
+    if cu['username'] not in dm_obj['participants']:
+        return jsonify({"status":"error","message":"Not a participant"}),403
+
+    msg_id = str(uuid.uuid4())
+    dm_msg = {
+        "id": msg_id,
+        "author": cu['username'],
+        "content": content,
+        "timestamp": datetime.utcnow().isoformat(),
+        "file_base64": file_base64
+    }
+    dm_obj['messages'].append(dm_msg)
+    save_db(db)
+    return jsonify({"status":"success","message_id":msg_id})
+
+# /dm_messages/<dm_id> [GET]
+@app.route('/dm_messages/<dm_id>', methods=['GET'])
+def dm_messages(dm_id):
+    db = load_db()
+    auth = request.headers.get('Authorization')
+    if not auth or not auth.startswith("Bearer "):
+        return jsonify({"status":"error","message":"Unauthorized"}),401
+    token = auth.split(" ")[1]
+    cu = find_user_by_token(db, token)
+    if not cu:
+        return jsonify({"status":"error","message":"Invalid token"}),401
+
+    dm_obj = find_dm(db, dm_id)
+    if not dm_obj:
+        return jsonify({"status":"error","message":"DM not found"}),404
+
+    if cu['username'] not in dm_obj['participants']:
+        return jsonify({"status":"error","message":"Not participant"}),403
+
+    return jsonify({"messages": dm_obj['messages']})
+
+# /edit_dm_message [POST]
+# {"dm_id":"...","message_id":"...","new_content":"..."}
+@app.route('/edit_dm_message', methods=['POST'])
+def edit_dm_message():
+    db = load_db()
+    auth = request.headers.get('Authorization')
+    token = None
+    if auth and auth.startswith("Bearer "):
+        token = auth.split(" ")[1]
+    if not token:
+        return jsonify({"status":"error","message":"Unauthorized"}),401
+    cu = find_user_by_token(db, token)
+    if not cu:
+        return jsonify({"status":"error","message":"Invalid token"}),401
+
+    data = request.get_json()
+    dm_id = data.get('dm_id')
+    message_id = data.get('message_id')
+    new_content = data.get('new_content')
+    dm_obj = find_dm(db, dm_id)
+    if not dm_obj:
+        return jsonify({"status":"error","message":"DM not found"}),404
+
+    if cu['username'] not in dm_obj['participants']:
+        return jsonify({"status":"error","message":"Not participant"}),403
+
+    msg = None
+    for m in dm_obj['messages']:
+        if m['id'] == message_id:
+            msg = m
+            break
+    if not msg:
+        return jsonify({"status":"error","message":"Message not found"}),404
+
+    if msg['author'] != cu['username']:
+        return jsonify({"status":"error","message":"No permission"}),403
+
+    msg['content'] = new_content
+    save_db(db)
+    return jsonify({"status":"success","message":"DM message edited"})
+
+
+# /delete_dm_message [POST]
+# {"dm_id":"...","message_id":"..."}
+@app.route('/delete_dm_message', methods=['POST'])
+def delete_dm_message():
+    db = load_db()
+    auth = request.headers.get('Authorization')
+    token = None
+    if auth and auth.startswith("Bearer "):
+        token = auth.split(" ")[1]
+    if not token:
+        return jsonify({"status":"error","message":"Unauthorized"}),401
+    cu = find_user_by_token(db, token)
+    if not cu:
+        return jsonify({"status":"error","message":"Invalid token"}),401
+
+    data = request.get_json()
+    dm_id = data.get('dm_id')
+    message_id = data.get('message_id')
+    dm_obj = find_dm(db, dm_id)
+    if not dm_obj:
+        return jsonify({"status":"error","message":"DM not found"}),404
+
+    if cu['username'] not in dm_obj['participants']:
+        return jsonify({"status":"error","message":"Not participant"}),403
+
+    msg_index = None
+    for i,m in enumerate(dm_obj['messages']):
+        if m['id'] == message_id:
+            msg_index = i
+            break
+    if msg_index is None:
+        return jsonify({"status":"error","message":"Message not found"}),404
+
+    msg = dm_obj['messages'][msg_index]
+    if msg['author'] != cu['username']:
+        return jsonify({"status":"error","message":"No permission"}),403
+
+    del dm_obj['messages'][msg_index]
+    save_db(db)
+    return jsonify({"status":"success","message":"DM message deleted"})
+
+##########################
+# Sunucu (Guild) İşlemleri
+##########################
+
+# /create_guild [POST]
+# {"name":"My Server"}
+@app.route('/create_guild', methods=['POST'])
+def create_guild():
+    db = load_db()
+    auth = request.headers.get('Authorization')
+    if not auth or not auth.startswith("Bearer "):
+        return jsonify({"status":"error","message":"Unauthorized"}),401
+    token = auth.split(" ")[1]
+    creator = find_user_by_token(db, token)
+    if not creator:
+        return jsonify({"status":"error","message":"Invalid token"}),401
+
+    data = request.get_json()
+    guild_name = data.get('name')
+
+    guild_id = str(uuid.uuid4())
+    admin_role = create_admin_role()
+    member_role = create_default_role()
+
+    new_guild = {
+        "id": guild_id,
+        "name": guild_name,
+        "owner": creator['username'],
+        "roles": [admin_role, member_role],
+        "members": [{
+            "username": creator['username'],
+            "roles": ["admin"],
+            "joined_at": datetime.utcnow().isoformat()
+        }],
+        "categories": [],
+        "channels": [],
+        "invites": [],
+        "emojis": [],
+        "audit_logs": [],
+        # Ban listesi gibi ek veriler
+        "bans": []
+    }
+
+    db['guilds'].append(new_guild)
+    if guild_id not in creator['guilds']:
+        creator['guilds'].append(guild_id)
+    add_audit_log(new_guild, "CREATE_GUILD", creator['username'], f"Guild {guild_name} created")
+    save_db(db)
+    return jsonify({"status":"success","guild_id":guild_id})
+
+# /guilds [GET]
+@app.route('/guilds', methods=['GET'])
+def list_guilds():
+    db = load_db()
+    guild_info = []
+    for g in db['guilds']:
+        guild_info.append({
+            "id": g['id'],
+            "name": g['name'],
+            "owner": g['owner'],
+            "member_count": len(g['members'])
+        })
+    return jsonify({"guilds": guild_info})
+
+# /guild/<guild_id> [GET]
+@app.route('/guild/<guild_id>', methods=['GET'])
+def get_guild(guild_id):
+    db = load_db()
+    guild = find_guild(db, guild_id)
+    if not guild:
+        return jsonify({"status":"error","message":"Guild not found"}),404
+    return jsonify({
+        "id": guild['id'],
+        "name": guild['name'],
+        "owner": guild['owner'],
+        "roles": [r['name'] for r in guild['roles']],
+        "categories": guild['categories'],
+        "channels": guild['channels'],
+        "member_count": len(guild['members'])
+    })
+
+# /create_category [POST]
+# {"guild_id":"...","name":"..."}
+@app.route('/create_category', methods=['POST'])
+def create_category():
+    db = load_db()
+    auth = request.headers.get('Authorization')
+    if not auth or not auth.startswith("Bearer "):
+        return jsonify({"status":"error","message":"Unauthorized"}),401
+    token = auth.split(" ")[1]
+    user = find_user_by_token(db, token)
+    if not user:
+        return jsonify({"status":"error","message":"Invalid token"}),401
+
+    data = request.get_json()
+    guild_id = data.get('guild_id')
+    name = data.get('name')
+
+    guild = find_guild(db, guild_id)
+    if not guild:
+        return jsonify({"status":"error","message":"Guild not found"}),404
+
+    if not user_has_permission(guild, user['username'], "manage_channels"):
+        return jsonify({"status":"error","message":"No permission"}),403
+
+    cat_id = str(uuid.uuid4())
+    guild['categories'].append({
+        "id": cat_id,
+        "name": name
+    })
+    add_audit_log(guild, "CREATE_CATEGORY", user['username'], f"Category {name}")
+    save_db(db)
+    return jsonify({"status":"success","category_id":cat_id})
+
+# /create_channel [POST]
+# {"guild_id":"...", "category_id":"optional","name":"...","description":"...","is_private":bool,"allowed_roles":["..."]}
+@app.route('/create_channel', methods=['POST'])
+def create_channel():
+    db = load_db()
+    auth = request.headers.get('Authorization')
+    if not auth or not auth.startswith("Bearer "):
+        return jsonify({"status":"error","message":"Unauthorized"}),401
+    token = auth.split(" ")[1]
+    user = find_user_by_token(db, token)
+    if not user:
+        return jsonify({"status":"error","message":"Invalid token"}),401
+
+    data = request.get_json()
+    guild_id = data.get('guild_id')
+    category_id = data.get('category_id', None)
+    name = data.get('name')
+    description = data.get('description', "")
+    is_private = data.get('is_private', False)
+    allowed_roles = data.get('allowed_roles', [])
+
+    guild = find_guild(db, guild_id)
+    if not guild:
+        return jsonify({"status":"error","message":"Guild not found"}),404
+
+    if not user_has_permission(guild, user['username'], "manage_channels"):
+        return jsonify({"status":"error","message":"No permission"}),403
+
+    if category_id and not find_category_in_guild(guild, category_id):
+        return jsonify({"status":"error","message":"Category not found"}),404
+
+    ch_id = str(uuid.uuid4())
+    new_channel = {
+        "id": ch_id,
+        "guild_id": guild_id,
+        "category_id": category_id,
+        "name": name,
+        "description": description,
+        "is_private": is_private,
+        "allowed_roles": allowed_roles,
+        "type": "text"  # Default text channel
+    }
+    guild['channels'].append(new_channel)
+    add_audit_log(guild, "CREATE_CHANNEL", user['username'], f"Channel {name}")
+    save_db(db)
+    return jsonify({"status":"success","channel_id":ch_id})
+
+##########################
+# Voice Channel & Screen Share
+##########################
+@app.route('/create_voice_channel', methods=['POST'])
+def create_voice_channel():
+    """
+    Body: {
+      "guild_id": "<guild_id>",
+      "name": "My Voice Channel",
+      "is_private": false,
+      "allowed_roles": ["admin","member"]
+    }
+    """
+    db = load_db()
+    auth = request.headers.get('Authorization')
+    if not auth or not auth.startswith("Bearer "):
+        return jsonify({"status": "error", "message": "Unauthorized"}), 401
+    token = auth.split(" ")[1]
+    user = find_user_by_token(db, token)
+    if not user:
+        return jsonify({"status": "error", "message": "Invalid token"}), 401
+    
+    data = request.get_json()
+    guild_id = data.get('guild_id')
+    name = data.get('name')
+    is_private = data.get('is_private', False)
+    allowed_roles = data.get('allowed_roles', [])
+    
+    guild = find_guild(db, guild_id)
+    if not guild:
+        return jsonify({"status":"error","message":"Guild not found"}),404
+    
+    if not user_has_permission(guild, user['username'], "manage_channels"):
+        return jsonify({"status":"error","message":"No permission"}),403
+
+    vc_id = str(uuid.uuid4())
+    new_voice_channel = {
+        "id": vc_id,
+        "guild_id": guild_id,
+        "name": name,
+        "type": "voice",
+        "is_private": is_private,
+        "allowed_roles": allowed_roles,
+        "connected_users": [],
+        "screen_share": {
+            "active": False,
+            "user": None
+        }
+    }
+    guild['channels'].append(new_voice_channel)
+    add_audit_log(guild, "CREATE_VOICE_CHANNEL", user['username'], f"Voice channel {name}")
+    save_db(db)
+    return jsonify({"status":"success","voice_channel_id":vc_id})
+
+@app.route('/join_voice_channel', methods=['POST'])
+def join_voice_channel():
+    """
+    Body: {"channel_id":"..."}
+    """
+    db = load_db()
+    auth = request.headers.get('Authorization')
+    if not auth or not auth.startswith("Bearer "):
+        return jsonify({"status": "error", "message": "Unauthorized"}), 401
+    token = auth.split(" ")[1]
+    cu = find_user_by_token(db, token)
+    if not cu:
+        return jsonify({"status": "error", "message": "Invalid token"}), 401
+
+    data = request.get_json()
+    channel_id = data.get('channel_id')
+    
+    ch_guild = None
+    ch_obj = None
+    for g in db['guilds']:
+        for c in g['channels']:
+            if c['id'] == channel_id and c.get('type') == 'voice':
+                ch_guild = g
+                ch_obj = c
+                break
+        if ch_obj:
+            break
+    
+    if not ch_obj:
+        return jsonify({"status":"error","message":"Voice channel not found"}),404
+    
+    if not user_in_guild(ch_guild, cu['username']):
+        return jsonify({"status":"error","message":"Not in guild"}),403
+
+    if ch_obj.get('is_private'):
+        member = user_in_guild(ch_guild, cu['username'])
+        if not any(r in ch_obj.get('allowed_roles', []) for r in member['roles']):
+            return jsonify({"status":"error","message":"No access to this voice channel"}),403
+    
+    if cu['username'] not in ch_obj['connected_users']:
+        ch_obj['connected_users'].append(cu['username'])
+    save_db(db)
+    return jsonify({"status":"success","message":"Joined voice channel"})
+
+@app.route('/leave_voice_channel', methods=['POST'])
+def leave_voice_channel():
+    """
+    Body: {"channel_id":"..."}
+    """
+    db = load_db()
+    auth = request.headers.get('Authorization')
+    if not auth or not auth.startswith("Bearer "):
+        return jsonify({"status": "error", "message": "Unauthorized"}), 401
+    token = auth.split(" ")[1]
+    cu = find_user_by_token(db, token)
+    if not cu:
+        return jsonify({"status": "error", "message": "Invalid token"}), 401
+
+    data = request.get_json()
+    channel_id = data.get('channel_id')
+
+    ch_guild = None
+    ch_obj = None
+    for g in db['guilds']:
+        for c in g['channels']:
+            if c['id'] == channel_id and c.get('type') == 'voice':
+                ch_guild = g
+                ch_obj = c
+                break
+        if ch_obj:
+            break
+    
+    if not ch_obj:
+        return jsonify({"status":"error","message":"Voice channel not found"}),404
+
+    if cu['username'] in ch_obj['connected_users']:
+        ch_obj['connected_users'].remove(cu['username'])
+    save_db(db)
+    return jsonify({"status":"success","message":"Left voice channel"})
+
+@app.route('/start_screen_share', methods=['POST'])
+def start_screen_share():
+    """
+    Body: {"channel_id":"..."}
+    """
+    db = load_db()
+    auth = request.headers.get('Authorization')
+    if not auth or not auth.startswith("Bearer "):
+        return jsonify({"status":"error","message":"Unauthorized"}),401
+    token = auth.split(" ")[1]
+    cu = find_user_by_token(db, token)
+    if not cu:
+        return jsonify({"status":"error","message":"Invalid token"}),401
+
+    data = request.get_json()
+    channel_id = data.get('channel_id')
+
+    ch_guild = None
+    ch_obj = None
+    for g in db['guilds']:
+        for c in g['channels']:
+            if c['id'] == channel_id and c.get('type') == 'voice':
+                ch_guild = g
+                ch_obj = c
+                break
+        if ch_obj:
+            break
+    if not ch_obj:
+        return jsonify({"status":"error","message":"Voice channel not found"}),404
+
+    if cu['username'] not in ch_obj['connected_users']:
+        return jsonify({"status":"error","message":"You are not in this voice channel"}),403
+
+    ch_obj['screen_share'] = {
+        "active": True,
+        "user": cu['username'],
+        "started_at": datetime.utcnow().isoformat()
+    }
+    save_db(db)
+    return jsonify({"status":"success","message":"Screen share started"})
+
+@app.route('/stop_screen_share', methods=['POST'])
+def stop_screen_share():
+    """
+    Body: {"channel_id":"..."}
+    """
+    db = load_db()
+    auth = request.headers.get('Authorization')
+    if not auth:
+        return jsonify({"status":"error","message":"Unauthorized"}),401
+    token = auth.split(" ")[1]
+    cu = find_user_by_token(db, token)
+    if not cu:
+        return jsonify({"status":"error","message":"Invalid token"}),401
+
+    data = request.get_json()
+    channel_id = data.get('channel_id')
+    
+    ch_guild = None
+    ch_obj = None
+    for g in db['guilds']:
+        for c in g['channels']:
+            if c['id'] == channel_id and c.get('type') == 'voice':
+                ch_guild = g
+                ch_obj = c
+                break
+        if ch_obj:
+            break
+    if not ch_obj:
+        return jsonify({"status":"error","message":"Voice channel not found"}),404
+    
+    scr_share = ch_obj.get('screen_share')
+    if not scr_share or not scr_share.get('active'):
+        return jsonify({"status":"error","message":"No active screen share"}),400
+
+    if scr_share['user'] != cu['username']:
+        return jsonify({"status":"error","message":"You are not the one sharing"}),403
+
+    ch_obj['screen_share'] = {"active": False, "user": None}
+    save_db(db)
+    return jsonify({"status":"success","message":"Screen share stopped"})
+
+##########################
+# Davetiye (Invite)
+##########################
+
+# /invite_create [POST]
+# {"guild_id":"...","channel_id":"...","expires_in_seconds":3600,"max_uses":10}
+@app.route('/invite_create', methods=['POST'])
+def invite_create():
+    db = load_db()
+    auth = request.headers.get('Authorization')
+    token = None
+    if auth and auth.startswith("Bearer "):
+        token = auth.split(" ")[1]
+    if not token:
+        return jsonify({"status":"error","message":"Unauthorized"}),401
+    user = find_user_by_token(db, token)
+    if not user:
+        return jsonify({"status":"error","message":"Invalid token"}),401
+
+    data = request.get_json()
+    guild_id = data.get('guild_id')
+    channel_id = data.get('channel_id')
+    expires_in = data.get('expires_in_seconds', 3600)
+    max_uses = data.get('max_uses', None)
+
+    guild = find_guild(db, guild_id)
+    if not guild:
+        return jsonify({"status":"error","message":"Guild not found"}),404
+
+    if not user_has_permission(guild, user['username'], "manage_channels"):
+        return jsonify({"status":"error","message":"No permission"}),403
+
+    ch = find_channel_in_guild(guild, channel_id)
+    if not ch:
+        return jsonify({"status":"error","message":"Channel not found"}),404
+
+    inv_id = str(uuid.uuid4())
+    expires_at = (datetime.utcnow() + timedelta(seconds=expires_in)).isoformat() if expires_in else None
+    new_invite = {
+        "id": inv_id,
+        "channel_id": channel_id,
+        "created_by": user['username'],
+        "expires_at": expires_at,
+        "uses": 0,
+        "max_uses": max_uses
+    }
+    guild['invites'].append(new_invite)
+    add_audit_log(guild, "CREATE_INVITE", user['username'], f"Invite {inv_id}")
+    save_db(db)
+    return jsonify({"status":"success","invite_id":inv_id})
+
+# /join_by_invite [POST]
+# {"invite_id":"..."}
+@app.route('/join_by_invite', methods=['POST'])
+def join_by_invite():
+    db = load_db()
+    auth = request.headers.get('Authorization')
+    token = None
+    if auth and auth.startswith("Bearer "):
+        token = auth.split(" ")[1]
+    if not token:
+        return jsonify({"status":"error","message":"Unauthorized"}),401
+    user = find_user_by_token(db, token)
+    if not user:
+        return jsonify({"status":"error","message":"Invalid token"}),401
+
+    data = request.get_json()
+    inv_id = data.get('invite_id')
+
+    found_inv = None
+    found_guild = None
+    for g in db['guilds']:
+        for inv in g['invites']:
+            if inv['id'] == inv_id:
+                found_inv = inv
+                found_guild = g
+                break
+        if found_inv:
+            break
+
+    if not found_inv:
+        return jsonify({"status":"error","message":"Invite not found"}),404
+
+    if not invite_valid(found_inv):
+        return jsonify({"status":"error","message":"Invite invalid or expired"}),400
+
+    if user_in_guild(found_guild, user['username']):
+        return jsonify({"status":"error","message":"Already in guild"}),400
+
+    found_guild['members'].append({
+        "username": user['username'],
+        "roles": ["member"],
+        "joined_at": datetime.utcnow().isoformat()
+    })
+    if found_guild['id'] not in user['guilds']:
+        user['guilds'].append(found_guild['id'])
+
+    found_inv['uses'] += 1
+    add_audit_log(found_guild, "GUILD_JOIN", user['username'], f"Joined via invite {inv_id}")
+    save_db(db)
+    return jsonify({"status":"success","message":"Joined guild"})
+
+##########################
+# Mesaj İşlemleri (Guild)
+##########################
+
+# /send_message [POST]
+# {"channel_id":"...","content":"...","file_base64":"optional"}
+@app.route('/send_message', methods=['POST'])
+def send_message():
+    db = load_db()
+    auth = request.headers.get('Authorization')
+    token = None
+    if auth and auth.startswith("Bearer "):
+        token = auth.split(" ")[1]
+    if not token:
+        return jsonify({"status":"error","message":"Unauthorized"}),401
+    cu = find_user_by_token(db, token)
+    if not cu:
+        return jsonify({"status":"error","message":"Invalid token"}),401
+
+    data = request.get_json()
+    channel_id = data.get('channel_id')
+    content = data.get('content')
+    file_base64 = data.get('file_base64', None)
+
+    ch_guild = None
+    ch_obj = None
+    for g in db['guilds']:
+        for c in g['channels']:
+            if c['id'] == channel_id:
+                ch_guild = g
+                ch_obj = c
+                break
+        if ch_obj:
+            break
+
+    if not ch_obj:
+        return jsonify({"status":"error","message":"Channel not found"}),404
+
+    if not user_in_guild(ch_guild, cu['username']):
+        return jsonify({"status":"error","message":"Not in guild"}),403
+
+    if not user_has_access_to_channel(ch_guild, cu, ch_obj):
+        return jsonify({"status":"error","message":"No access to this channel"}),403
+
+    msg_id = str(uuid.uuid4())
+    new_msg = {
+        "id": msg_id,
+        "channel_id": channel_id,
+        "author": cu['username'],
+        "content": content,
+        "timestamp": datetime.utcnow().isoformat(),
+        "file_base64": file_base64,
+        "pinned": False,
+        "reactions": []
+    }
+    db['messages'].append(new_msg)
+    save_db(db)
+    return jsonify({"status":"success","message_id":msg_id})
+
+# /messages/<channel_id> [GET]
+@app.route('/messages/<channel_id>', methods=['GET'])
+def get_messages(channel_id):
+    db = load_db()
+    ch_guild = None
+    ch_obj = None
+    for g in db['guilds']:
+        for c in g['channels']:
+            if c['id'] == channel_id:
+                ch_guild = g
+                ch_obj = c
+                break
+        if ch_obj:
+            break
+
+    if not ch_obj:
+        return jsonify({"status":"error","message":"Channel not found"}),404
+
+    auth = request.headers.get('Authorization')
+    token = None
+    if auth and auth.startswith("Bearer "):
+        token = auth.split(" ")[1]
+
+    if is_channel_private(ch_obj):
+        if not token:
+            return jsonify({"status":"error","message":"Unauthorized"}),401
+        cu = find_user_by_token(db, token)
+        if not cu:
+            return jsonify({"status":"error","message":"Invalid token"}),401
+        if not user_in_guild(ch_guild, cu['username']):
+            return jsonify({"status":"error","message":"Not in guild"}),403
+        if not user_has_access_to_channel(ch_guild, cu, ch_obj):
+            return jsonify({"status":"error","message":"No access"}),403
+
+    msgs = [m for m in db['messages'] if m['channel_id'] == channel_id]
+    return jsonify({"messages": msgs})
+
+# /edit_message [POST]
+# {"message_id":"...","new_content":"..."}
+@app.route('/edit_message', methods=['POST'])
+def edit_message():
+    db = load_db()
+    auth = request.headers.get('Authorization')
+    if not auth or not auth.startswith("Bearer "):
+        return jsonify({"status":"error","message":"Unauthorized"}),401
+    token = auth.split(" ")[1]
+    cu = find_user_by_token(db, token)
+    if not cu:
+        return jsonify({"status":"error","message":"Invalid token"}),401
+
+    data = request.get_json()
+    message_id = data.get('message_id')
+    new_content = data.get('new_content')
+
+    msg = message_belongs_to_channel(db, message_id)
+    if not msg:
+        return jsonify({"status":"error","message":"Message not found"}),404
+
+    ch_guild = None
+    ch_obj = None
+    for g in db['guilds']:
+        for c in g['channels']:
+            if c['id'] == msg['channel_id']:
+                ch_guild = g
+                ch_obj = c
+                break
+        if ch_obj:
+            break
+
+    if not user_in_guild(ch_guild, cu['username']):
+        return jsonify({"status":"error","message":"Not in guild"}),403
+
+    if not user_has_access_to_channel(ch_guild, cu, ch_obj):
+        return jsonify({"status":"error","message":"No access"}),403
+
+    # Yazar veya manage_channels izni olan düzenleyebilir
+    if msg['author'] != cu['username'] and not user_has_permission(ch_guild, cu['username'], "manage_channels"):
+        return jsonify({"status":"error","message":"No permission"}),403
+
+    msg['content'] = new_content
+    save_db(db)
+    return jsonify({"status":"success","message":"Message edited"})
+
+# /delete_message [POST]
+# {"message_id":"..."}
+@app.route('/delete_message', methods=['POST'])
+def delete_message():
+    db = load_db()
+    auth = request.headers.get('Authorization')
+    if not auth or not auth.startswith("Bearer "):
+        return jsonify({"status":"error","message":"Unauthorized"}),401
+    token = auth.split(" ")[1]
+    cu = find_user_by_token(db, token)
+    if not cu:
+        return jsonify({"status":"error","message":"Invalid token"}),401
+
+    data = request.get_json()
+    message_id = data.get('message_id')
+    msg_index = None
+    msg_obj = None
+    for i,m in enumerate(db['messages']):
+        if m['id'] == message_id:
+            msg_index = i
+            msg_obj = m
+            break
+    if msg_index is None:
+        return jsonify({"status":"error","message":"Message not found"}),404
+
+    ch_guild = None
+    ch_obj = None
+    for g in db['guilds']:
+        for c in g['channels']:
+            if c['id'] == msg_obj['channel_id']:
+                ch_guild = g
+                ch_obj = c
+                break
+        if ch_obj:
+            break
+
+    if not user_in_guild(ch_guild, cu['username']):
+        return jsonify({"status":"error","message":"Not in guild"}),403
+
+    if not user_has_access_to_channel(ch_guild, cu, ch_obj):
+        return jsonify({"status":"error","message":"No access"}),403
+
+    if msg_obj['author'] != cu['username'] and not user_has_permission(ch_guild, cu['username'], "manage_channels"):
+        return jsonify({"status":"error","message":"No permission"}),403
+
+    del db['messages'][msg_index]
+    save_db(db)
+    return jsonify({"status":"success","message":"Message deleted"})
+
+# /pin_message [POST]
+# {"message_id":"..."}
+@app.route('/pin_message', methods=['POST'])
+def pin_message():
+    db = load_db()
+    auth = request.headers.get('Authorization')
+    if not auth:
+        return jsonify({"status":"error","message":"Unauthorized"}),401
+    token = auth.split(" ")[1]
+    cu = find_user_by_token(db, token)
+    if not cu:
+        return jsonify({"status":"error","message":"Invalid token"}),401
+
+    data = request.get_json()
+    message_id = data.get('message_id')
+    msg = message_belongs_to_channel(db, message_id)
+    if not msg:
+        return jsonify({"status":"error","message":"Message not found"}),404
+
+    ch_guild = None
+    ch_obj = None
+    for g in db['guilds']:
+        for c in g['channels']:
+            if c['id'] == msg['channel_id']:
+                ch_guild = g
+                ch_obj = c
+                break
+        if ch_obj:
+            break
+
+    if not user_in_guild(ch_guild, cu['username']):
+        return jsonify({"status":"error","message":"Not in guild"}),403
+
+    if not user_has_permission(ch_guild, cu['username'], "manage_channels"):
+        return jsonify({"status":"error","message":"No permission"}),403
+
+    msg['pinned'] = True
+    save_db(db)
+    return jsonify({"status":"success","message":"Message pinned"})
+
+# /search_messages [GET]
+# query params: q=...
+@app.route('/search_messages', methods=['GET'])
+def search_messages():
+    db = load_db()
+    q = request.args.get('q', "")
+    results = []
+    for m in db['messages']:
+        if q.lower() in m['content'].lower():
+            results.append(m)
+    return jsonify({"results": results})
+
+# /add_reaction [POST]
+# {"message_id":"...","emoji_id":"..."}
+@app.route('/add_reaction', methods=['POST'])
+def add_reaction():
+    db = load_db()
+    auth = request.headers.get('Authorization')
+    if not auth:
+        return jsonify({"status":"error","message":"Unauthorized"}),401
+    token = auth.split(" ")[1]
+    cu = find_user_by_token(db, token)
+    if not cu:
+        return jsonify({"status":"error","message":"Invalid token"}),401
+
+    data = request.get_json()
+    message_id = data.get('message_id')
+    emoji_id = data.get('emoji_id')
+
+    msg = message_belongs_to_channel(db, message_id)
+    if not msg:
+        return jsonify({"status":"error","message":"Message not found"}),404
+
+    ch_guild = None
+    ch_obj = None
+    for g in db['guilds']:
+        for c in g['channels']:
+            if c['id'] == msg['channel_id']:
+                ch_guild = g
+                ch_obj = c
+                break
+        if ch_obj:
+            break
+
+    if not user_in_guild(ch_guild, cu['username']):
+        return jsonify({"status":"error","message":"Not in guild"}),403
+
+    emoji = find_emoji(ch_guild, emoji_id)
+    if not emoji:
+        return jsonify({"status":"error","message":"Emoji not found"}),404
+
+    found_reaction = None
+    for r in msg['reactions']:
+        if r['emoji_id'] == emoji_id:
+            found_reaction = r
+            break
+    if found_reaction:
+        if cu['username'] not in found_reaction['users']:
+            found_reaction['users'].append(cu['username'])
+    else:
+        msg['reactions'].append({
+            "emoji_id": emoji_id,
+            "users": [cu['username']]
+        })
+    save_db(db)
+    return jsonify({"status":"success","message":"Reaction added"})
+
+# /remove_reaction [POST]
+# {"message_id":"...","emoji_id":"..."}
+@app.route('/remove_reaction', methods=['POST'])
+def remove_reaction():
+    db = load_db()
+    auth = request.headers.get('Authorization')
+    if not auth:
+        return jsonify({"status":"error","message":"Unauthorized"}),401
+    token = auth.split(" ")[1]
+    cu = find_user_by_token(db, token)
+    if not cu:
+        return jsonify({"status":"error","message":"Invalid token"}),401
+
+    data = request.get_json()
+    message_id = data.get('message_id')
+    emoji_id = data.get('emoji_id')
+
+    msg = message_belongs_to_channel(db, message_id)
+    if not msg:
+        return jsonify({"status":"error","message":"Message not found"}),404
+
+    ch_guild = None
+    for g in db['guilds']:
+        for c in g['channels']:
+            if c['id'] == msg['channel_id']:
+                ch_guild = g
+                break
+        if ch_guild:
+            break
+
+    found_reaction = None
+    for r in msg['reactions']:
+        if r['emoji_id'] == emoji_id:
+            found_reaction = r
+            break
+    if not found_reaction:
+        return jsonify({"status":"error","message":"Reaction not found"}),404
+
+    if cu['username'] in found_reaction['users']:
+        found_reaction['users'].remove(cu['username'])
+        if len(found_reaction['users']) == 0:
+            msg['reactions'].remove(found_reaction)
+        save_db(db)
+        return jsonify({"status":"success","message":"Reaction removed"})
+    else:
+        return jsonify({"status":"error","message":"You did not react"}),400
+
+##########################
+# Emoji Yönetimi (Guild)
+##########################
+
+# /add_emoji [POST]
+# {"guild_id":"...","name":"...","image_base64":"..."}
+@app.route('/add_emoji', methods=['POST'])
+def add_emoji():
+    db = load_db()
+    auth = request.headers.get('Authorization')
+    if not auth:
+        return jsonify({"status":"error","message":"Unauthorized"}),401
+    token = auth.split(" ")[1]
+    cu = find_user_by_token(db, token)
+    if not cu:
+        return jsonify({"status":"error","message":"Invalid token"}),401
+
+    data = request.get_json()
+    guild_id = data.get('guild_id')
+    name = data.get('name')
+    image_base64 = data.get('image_base64')
+
+    guild = find_guild(db, guild_id)
+    if not guild:
+        return jsonify({"status":"error","message":"Guild not found"}),404
+
+    if not user_has_permission(guild, cu['username'], "manage_guild"):
+        return jsonify({"status":"error","message":"No permission"}),403
+
+    emoji_id = str(uuid.uuid4())
+    guild['emojis'].append({
+        "id": emoji_id,
+        "name": name,
+        "image_base64": image_base64
+    })
+    add_audit_log(guild, "ADD_EMOJI", cu['username'], f"Emoji {name}")
+    save_db(db)
+    return jsonify({"status":"success","emoji_id":emoji_id})
+
+# /remove_emoji [POST]
+# {"guild_id":"...","emoji_id":"..."}
+@app.route('/remove_emoji', methods=['POST'])
+def remove_emoji():
+    db = load_db()
+    auth = request.headers.get('Authorization')
+    if not auth:
+        return jsonify({"status":"error","message":"Unauthorized"}),401
+    token = auth.split(" ")[1]
+    cu = find_user_by_token(db, token)
+    if not cu:
+        return jsonify({"status":"error","message":"Invalid token"}),401
+
+    data = request.get_json()
+    guild_id = data.get('guild_id')
+    emoji_id = data.get('emoji_id')
+
+    guild = find_guild(db, guild_id)
+    if not guild:
+        return jsonify({"status":"error","message":"Guild not found"}),404
+
+    if not user_has_permission(guild, cu['username'], "manage_guild"):
+        return jsonify({"status":"error","message":"No permission"}),403
+
+    e_index = None
+    for i,e in enumerate(guild['emojis']):
+        if e['id'] == emoji_id:
+            e_index = i
+            break
+    if e_index is None:
+        return jsonify({"status":"error","message":"Emoji not found"}),404
+
+    del guild['emojis'][e_index]
+    add_audit_log(guild, "REMOVE_EMOJI", cu['username'], f"Removed emoji {emoji_id}")
+    save_db(db)
+    return jsonify({"status":"success","message":"Emoji removed"})
+
+##########################
+# Üye Yönetimi (Kick / Ban)
+##########################
+
+# /kick_member [POST]
+# {"guild_id":"...","username":"..."}
+@app.route('/kick_member', methods=['POST'])
+def kick_member():
+    db = load_db()
+    auth = request.headers.get('Authorization')
+    if not auth:
+        return jsonify({"status":"error","message":"Unauthorized"}),401
+    token = auth.split(" ")[1]
+    cu = find_user_by_token(db, token)
+    if not cu:
+        return jsonify({"status":"error","message":"Invalid token"}),401
+
+    data = request.get_json()
+    guild_id = data.get('guild_id')
+    target_user = data.get('username')
+
+    guild = find_guild(db, guild_id)
+    if not guild:
+        return jsonify({"status":"error","message":"Guild not found"}),404
+
+    if not user_has_permission(guild, cu['username'], "kick_members"):
+        return jsonify({"status":"error","message":"No permission"}),403
+
+    mem = user_in_guild(guild, target_user)
+    if not mem:
+        return jsonify({"status":"error","message":"User not in guild"}),404
+
+    # Remove user from guild
+    guild['members'] = [m for m in guild['members'] if m['username'] != target_user]
+    t_user = find_user(db, target_user)
+    if guild_id in t_user['guilds']:
+        t_user['guilds'].remove(guild_id)
+    add_audit_log(guild, "KICK_MEMBER", cu['username'], f"Kicked {target_user}")
+    save_db(db)
+    return jsonify({"status":"success","message":"User kicked"})
+
+# /ban_member [POST]
+# {"guild_id":"...","username":"..."}
+@app.route('/ban_member', methods=['POST'])
+def ban_member():
+    db = load_db()
+    auth = request.headers.get('Authorization')
+    if not auth:
+        return jsonify({"status":"error","message":"Unauthorized"}),401
+    token = auth.split(" ")[1]
+    cu = find_user_by_token(db, token)
+    if not cu:
+        return jsonify({"status":"error","message":"Invalid token"}),401
+
+    data = request.get_json()
+    guild_id = data.get('guild_id')
+    target_user = data.get('username')
+
+    guild = find_guild(db, guild_id)
+    if not guild:
+        return jsonify({"status":"error","message":"Guild not found"}),404
+
+    if not user_has_permission(guild, cu['username'], "ban_members"):
+        return jsonify({"status":"error","message":"No permission"}),403
+
+    mem = user_in_guild(guild, target_user)
+    if mem:
+        guild['members'] = [m for m in guild['members'] if m['username'] != target_user]
+        t_user = find_user(db, target_user)
+        if t_user and guild_id in t_user['guilds']:
+            t_user['guilds'].remove(guild_id)
+
+    if 'bans' not in guild:
+        guild['bans'] = []
+    if target_user not in guild['bans']:
+        guild['bans'].append(target_user)
+
+    add_audit_log(guild, "BAN_MEMBER", cu['username'], f"Banned {target_user}")
+    save_db(db)
+    return jsonify({"status":"success","message":"User banned"})
+
+# /unban_member [POST]
+# {"guild_id":"...","username":"..."}
+@app.route('/unban_member', methods=['POST'])
+def unban_member():
+    db = load_db()
+    auth = request.headers.get('Authorization')
+    if not auth:
+        return jsonify({"status":"error","message":"Unauthorized"}),401
+    token = auth.split(" ")[1]
+    cu = find_user_by_token(db, token)
+    if not cu:
+        return jsonify({"status":"error","message":"Invalid token"}),401
+
+    data = request.get_json()
+    guild_id = data.get('guild_id')
+    target_user = data.get('username')
+
+    guild = find_guild(db, guild_id)
+    if not guild:
+        return jsonify({"status":"error","message":"Guild not found"}),404
+
+    if not user_has_permission(guild, cu['username'], "ban_members"):
+        return jsonify({"status":"error","message":"No permission"}),403
+
+    if 'bans' not in guild or target_user not in guild['bans']:
+        return jsonify({"status":"error","message":"User not banned"}),400
+
+    guild['bans'].remove(target_user)
+    add_audit_log(guild, "UNBAN_MEMBER", cu['username'], f"Unbanned {target_user}")
+    save_db(db)
+    return jsonify({"status":"success","message":"User unbanned"})
+
+##########################
+# Audit Logs
+##########################
+# /audit_logs/<guild_id> [GET]
+@app.route('/audit_logs/<guild_id>', methods=['GET'])
+def audit_logs(guild_id):
+    db = load_db()
+    guild = find_guild(db, guild_id)
+    if not guild:
+        return jsonify({"status":"error","message":"Guild not found"}),404
+
+    return jsonify({"audit_logs": guild['audit_logs']})
+
+##########################
+# Uygulama Başlatma
+##########################
 if __name__ == '__main__':
-    socketio.run(app, debug=True)
+    app.run(debug=True)
